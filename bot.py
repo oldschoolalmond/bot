@@ -13,7 +13,7 @@ load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-# Путь для Railway Volume (создайте Volume с Mount Path /app/data)
+# Путь для Railway Volume
 DB_PATH = "/app/data/bot_data.db" if os.path.exists("/app/data") else "bot_data.db"
 
 bot = Bot(token=TOKEN)
@@ -26,19 +26,21 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS user_states (user_id INTEGER PRIMARY KEY, thread_id INTEGER)")
         await db.commit()
 
-# --- Регистрация топиков в группе ---
+# --- Логика в группе (Добавление разделов) ---
 @dp.message(F.chat.id == GROUP_ID, Command("save_topic"))
 async def save_topic(message: types.Message):
     name = message.text.replace("/save_topic", "").strip()
     if not name:
-        return await message.answer("Использование: /save_topic Название")
+        return await message.answer("Usage: /save_topic Section Name")
     
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR REPLACE INTO topics VALUES (?, ?)", (message.message_thread_id, name))
         await db.commit()
-    await message.answer(f"✅ Раздел '{name}' добавлен!")
+    
+    # Подтверждение в группе (можно удалить, если нужна полная тишина)
+    await message.answer(f"✅ Section '{name}' has been added to the bot menu.")
 
-# --- Работа в личке ---
+# --- Логика в личке (на английском) ---
 @dp.message(CommandStart(), F.chat.type == "private")
 async def start_private(message: types.Message):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -46,34 +48,42 @@ async def start_private(message: types.Message):
             topics = await cursor.fetchall()
     
     if not topics:
-        return await message.answer("Разделы еще не настроены админом в группе.")
+        return await message.answer("No sections found. Admin must set them up in the group first.")
 
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=t[0])] for t in topics], resize_keyboard=True)
-    await message.answer("Выберите раздел для публикации:", reply_markup=kb)
+    await message.answer("Please select a section for your post:", reply_markup=kb)
 
 @dp.message(F.chat.type == "private")
 async def handle_msg(message: types.Message):
+    user_id = message.from_user.id
     async with aiosqlite.connect(DB_PATH) as db:
-        # Если нажата кнопка с названием топика
+        # Проверяем, нажата ли кнопка раздела
         async with db.execute("SELECT thread_id FROM topics WHERE name = ?", (message.text,)) as cursor:
             topic = await cursor.fetchone()
         
         if topic:
-            await db.execute("INSERT OR REPLACE INTO user_states VALUES (?, ?)", (message.from_user.id, topic[0]))
+            await db.execute("INSERT OR REPLACE INTO user_states VALUES (?, ?)", (user_id, topic[0]))
             await db.commit()
-            return await message.answer(f"👌 Ок, теперь всё, что вы напишете, отправится в '{message.text}'")
+            return await message.answer(f"✅ Target section: **{message.text}**\n\nNow, send me the message (text, photo, or file) you want to publish.")
 
-        # Если это просто сообщение — пересылаем
-        async with db.execute("SELECT thread_id FROM user_states WHERE user_id = ?", (message.from_user.id,)) as cursor:
+        # Если раздел выбран, копируем контент в группу
+        async with db.execute("SELECT thread_id FROM user_states WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             if row:
-                await bot.copy_message(chat_id=GROUP_ID, from_chat_id=message.chat.id, 
-                                       message_id=message.message_id, message_thread_id=row[0])
-                await message.answer("🚀 Опубликовано!")
+                try:
+                    await bot.copy_message(
+                        chat_id=GROUP_ID, 
+                        from_chat_id=message.chat.id, 
+                        message_id=message.message_id, 
+                        message_thread_id=row[0]
+                    )
+                    await message.answer("🚀 Published successfully!")
+                except Exception as e:
+                    await message.answer(f"❌ Error: {e}")
             else:
-                await message.answer("Сначала выберите раздел кнопкой.")
+                await message.answer("⚠️ Please select a section using the menu buttons first.")
 
-# --- Webhook ---
+# --- Запуск Webhook ---
 @app.on_event("startup")
 async def on_startup():
     await init_db()
