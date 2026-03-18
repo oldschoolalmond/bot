@@ -1,146 +1,89 @@
 import os
-import asyncio
 import aiosqlite
+import uvicorn
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from dotenv import load_dotenv
 
-# === НАСТРОЙКИ ===
-TOKEN = os.getenv("BOT_TOKEN", "ВАШ_ТОКЕН")
-GROUP_ID = os.getenv("GROUP_ID", "-100...") # ID вашей группы
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://your-app.up.railway.app")
-DB_NAME = "bot_data.db" # База данных SQLite
+load_dotenv()
+
+# Настройки
+TOKEN = os.getenv("BOT_TOKEN")
+GROUP_ID = int(os.getenv("GROUP_ID"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+# Путь для Railway Volume (создайте Volume с Mount Path /app/data)
+DB_PATH = "/app/data/bot_data.db" if os.path.exists("/app/data") else "bot_data.db"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 app = FastAPI()
 
-# === БАЗА ДАННЫХ ===
 async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        # Таблица для разделов (топиков)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS topics (
-                thread_id INTEGER PRIMARY KEY,
-                name TEXT
-            )
-        """)
-        # Таблица для запоминания, какой раздел выбрал юзер в личке
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS user_states (
-                user_id INTEGER PRIMARY KEY,
-                selected_thread_id INTEGER
-            )
-        """)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS topics (thread_id INTEGER PRIMARY KEY, name TEXT)")
+        await db.execute("CREATE TABLE IF NOT EXISTS user_states (user_id INTEGER PRIMARY KEY, thread_id INTEGER)")
         await db.commit()
 
-# === ЛОГИКА В ГРУППЕ (СБОР ТОПИКОВ) ===
-
-# 1. Автоматический перехват создания нового топика
-@dp.message(F.chat.id == int(GROUP_ID), F.forum_topic_created)
-async def catch_new_topic(message: types.Message):
-    topic_name = message.forum_topic_created.name
-    thread_id = message.message_thread_id
+# --- Регистрация топиков в группе ---
+@dp.message(F.chat.id == GROUP_ID, Command("save_topic"))
+async def save_topic(message: types.Message):
+    name = message.text.replace("/save_topic", "").strip()
+    if not name:
+        return await message.answer("Использование: /save_topic Название")
     
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO topics (thread_id, name) VALUES (?, ?)", 
-            (thread_id, topic_name)
-        )
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO topics VALUES (?, ?)", (message.message_thread_id, name))
         await db.commit()
-    await message.answer(f"🤖 Раздел «{topic_name}» автоматически добавлен в меню бота!")
+    await message.answer(f"✅ Раздел '{name}' добавлен!")
 
-# 2. Ручное добавление старых топиков (пишем /save_topic Имя раздела прямо в топике)
-@dp.message(Command("save_topic"), F.chat.id == int(GROUP_ID))
-async def save_existing_topic(message: types.Message):
-    # Убираем команду из текста, оставляем только название
-    topic_name = message.text.replace("/save_topic", "").strip()
-    if not topic_name:
-        await message.answer("Укажите название: /save_topic Название раздела")
-        return
-        
-    thread_id = message.message_thread_id
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO topics (thread_id, name) VALUES (?, ?)", 
-            (thread_id, topic_name)
-        )
-        await db.commit()
-    await message.answer(f"✅ Раздел «{topic_name}» сохранен в базу!")
-
-# === ЛОГИКА В ЛИЧНЫХ СООБЩЕНИЯХ (ПУБЛИКАЦИЯ) ===
-
-# 1. Команда /start и вывод кнопок
+# --- Работа в личке ---
 @dp.message(CommandStart(), F.chat.type == "private")
-async def cmd_start(message: types.Message):
-    async with aiosqlite.connect(DB_NAME) as db:
+async def start_private(message: types.Message):
+    async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT name FROM topics") as cursor:
             topics = await cursor.fetchall()
-            
-    if not topics:
-        await message.answer("Разделы еще не добавлены. Админ должен добавить их в группе.")
-        return
-
-    # Создаем клавиатуру из базы данных
-    buttons = [[KeyboardButton(text=row[0])] for row in topics]
-    keyboard = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
     
-    await message.answer("Выберите раздел, куда хотите отправить сообщение:", reply_markup=keyboard)
+    if not topics:
+        return await message.answer("Разделы еще не настроены админом в группе.")
 
-# 2. Обработка всех остальных текстовых сообщений и картинок в личке
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=t[0])] for t in topics], resize_keyboard=True)
+    await message.answer("Выберите раздел для публикации:", reply_markup=kb)
+
 @dp.message(F.chat.type == "private")
-async def handle_private_message(message: types.Message):
-    user_id = message.from_user.id
-    text = message.text or message.caption or ""
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        # Проверяем, не является ли текст названием топика (клик по кнопке)
-        async with db.execute("SELECT thread_id FROM topics WHERE name = ?", (text,)) as cursor:
+async def handle_msg(message: types.Message):
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Если нажата кнопка с названием топика
+        async with db.execute("SELECT thread_id FROM topics WHERE name = ?", (message.text,)) as cursor:
             topic = await cursor.fetchone()
-            
+        
         if topic:
-            # Юзер выбрал топик - сохраняем его выбор
-            thread_id = topic[0]
-            await db.execute(
-                "INSERT OR REPLACE INTO user_states (user_id, selected_thread_id) VALUES (?, ?)", 
-                (user_id, thread_id)
-            )
+            await db.execute("INSERT OR REPLACE INTO user_states VALUES (?, ?)", (message.from_user.id, topic[0]))
             await db.commit()
-            await message.answer(f"✅ Выбран раздел: {text}\n\nТеперь отправьте сюда сообщение (текст, фото, видео), и я опубликую его в группе.")
-            return
+            return await message.answer(f"👌 Ок, теперь всё, что вы напишете, отправится в '{message.text}'")
 
-        # Если это не клик по кнопке раздела, значит юзер прислал контент для публикации
-        async with db.execute("SELECT selected_thread_id FROM user_states WHERE user_id = ?", (user_id,)) as cursor:
-            state = await cursor.fetchone()
+        # Если это просто сообщение — пересылаем
+        async with db.execute("SELECT thread_id FROM user_states WHERE user_id = ?", (message.from_user.id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                await bot.copy_message(chat_id=GROUP_ID, from_chat_id=message.chat.id, 
+                                       message_id=message.message_id, message_thread_id=row[0])
+                await message.answer("🚀 Опубликовано!")
+            else:
+                await message.answer("Сначала выберите раздел кнопкой.")
 
-    # Если раздел выбран - пересылаем контент
-    if state:
-        thread_id = state[0]
-        try:
-            # copy_message копирует любой тип контента: текст, фото, файлы
-            await bot.copy_message(
-                chat_id=GROUP_ID,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id,
-                message_thread_id=thread_id
-            )
-            await message.answer("🚀 Успешно опубликовано!")
-        except Exception as e:
-            await message.answer(f"❌ Ошибка отправки (возможно, меня удалили из топика): {e}")
-    else:
-        await message.answer("⚠️ Сначала выберите раздел с помощью кнопок меню.")
-
-# === FASTAPI ЗАПУСК И WEBHOOK ===
-
+# --- Webhook ---
 @app.on_event("startup")
 async def on_startup():
     await init_db()
-    await bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
-    print("Бот запущен, вебхук установлен!")
+    await bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", drop_pending_updates=True)
 
 @app.post("/webhook")
-async def webhook_endpoint(request: Request):
+async def webhook(request: Request):
     update = types.Update.model_validate(await request.json(), context={"bot": bot})
     await dp.feed_update(bot, update)
-    return {"status": "ok"}
+    return {"ok": True}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
