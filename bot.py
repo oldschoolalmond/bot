@@ -13,7 +13,7 @@ load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-# Путь для Railway Volume
+# Путь для Railway Volume (убедись, что создала Volume в панели Railway)
 DB_PATH = "/app/data/bot_data.db" if os.path.exists("/app/data") else "bot_data.db"
 
 bot = Bot(token=TOKEN)
@@ -26,7 +26,7 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS user_states (user_id INTEGER PRIMARY KEY, thread_id INTEGER)")
         await db.commit()
 
-# --- Логика в группе (Добавление разделов) ---
+# --- Логика в группе (Регистрация разделов) ---
 @dp.message(F.chat.id == GROUP_ID, Command("save_topic"))
 async def save_topic(message: types.Message):
     name = message.text.replace("/save_topic", "").strip()
@@ -36,11 +36,9 @@ async def save_topic(message: types.Message):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR REPLACE INTO topics VALUES (?, ?)", (message.message_thread_id, name))
         await db.commit()
-    
-    # Подтверждение в группе (можно удалить, если нужна полная тишина)
-    await message.answer(f"✅ Section '{name}' has been added to the bot menu.")
+    await message.answer(f"✅ Section '{name}' linked successfully.")
 
-# --- Логика в личке (на английском) ---
+# --- Логика в личке (Интерфейс на английском) ---
 @dp.message(CommandStart(), F.chat.type == "private")
 async def start_private(message: types.Message):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -57,33 +55,42 @@ async def start_private(message: types.Message):
 async def handle_msg(message: types.Message):
     user_id = message.from_user.id
     async with aiosqlite.connect(DB_PATH) as db:
-        # Проверяем, нажата ли кнопка раздела
+        # Проверяем выбор раздела кнопкой
         async with db.execute("SELECT thread_id FROM topics WHERE name = ?", (message.text,)) as cursor:
             topic = await cursor.fetchone()
         
         if topic:
             await db.execute("INSERT OR REPLACE INTO user_states VALUES (?, ?)", (user_id, topic[0]))
             await db.commit()
-            return await message.answer(f"✅ Target section: **{message.text}**\n\nNow, send me the message (text, photo, or file) you want to publish.")
+            return await message.answer(f"✅ Target: **{message.text}**\n\nSend your message now.")
 
-        # Если раздел выбран, копируем контент в группу
+        # Получаем текущий выбранный раздел юзера
         async with db.execute("SELECT thread_id FROM user_states WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
-            if row:
-                try:
-                    await bot.copy_message(
-                        chat_id=GROUP_ID, 
-                        from_chat_id=message.chat.id, 
-                        message_id=message.message_id, 
-                        message_thread_id=row[0]
-                    )
-                    await message.answer("🚀 Published successfully!")
-                except Exception as e:
-                    await message.answer(f"❌ Error: {e}")
+            
+    if row:
+        thread_id = row[0]
+        try:
+            # АЛЬТЕРНАТИВНЫЙ МЕТОД: Отправляем как новое сообщение
+            if message.text:
+                await bot.send_message(chat_id=GROUP_ID, text=message.text, message_thread_id=thread_id)
+            elif message.photo:
+                await bot.send_photo(chat_id=GROUP_ID, photo=message.photo[-1].file_id, caption=message.caption, message_thread_id=thread_id)
+            elif message.video:
+                await bot.send_video(chat_id=GROUP_ID, video=message.video.file_id, caption=message.caption, message_thread_id=thread_id)
+            elif message.document:
+                await bot.send_document(chat_id=GROUP_ID, document=message.document.file_id, caption=message.caption, message_thread_id=thread_id)
             else:
-                await message.answer("⚠️ Please select a section using the menu buttons first.")
+                # Если тип сложный, используем copy (но анонимность должна быть вкл в ТГ)
+                await bot.copy_message(chat_id=GROUP_ID, from_chat_id=message.chat.id, message_id=message.message_id, message_thread_id=thread_id)
+            
+            await message.answer("🚀 Published successfully!")
+        except Exception as e:
+            await message.answer(f"❌ Error: {e}")
+    else:
+        await message.answer("⚠️ Select a section first.")
 
-# --- Запуск Webhook ---
+# --- Fast API & Webhook ---
 @app.on_event("startup")
 async def on_startup():
     await init_db()
