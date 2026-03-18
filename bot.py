@@ -1,10 +1,23 @@
-# Замени этот блок в main.py:
+import os
+import aiosqlite
+import uvicorn
+from fastapi import FastAPI, Request
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, CommandStart
+# ... остальные импорты ...
+
+# 1. Сначала настройки
+TOKEN = os.getenv("BOT_TOKEN")
+GROUP_ID = int(os.getenv("GROUP_ID") or 0)
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
+# 2. Потом создание объектов (ВАЖНО!)
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+app = FastAPI()
+
+# 3. И только ТЕПЕРЬ обработчики (твой дебаг-код)
 @dp.message(F.chat.id == GROUP_ID)
 async def debug_handler(message: types.Message):
-    print(f"Got message from group! Text: {message.text}") # Это появится в логах Railway
-    if message.text and "/save_topic" in message.text:
-        name = message.text.replace("/save_topic", "").strip()
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("INSERT OR REPLACE INTO topics VALUES (?, ?)", (message.message_thread_id, name))
-            await db.commit()
-        await message.answer(f"✅ Debug: Saved {name} in thread {message.message_thread_id}")
+    print(f"Got message from group! Text: {message.text}")
+    # ... остальной код функции ...
